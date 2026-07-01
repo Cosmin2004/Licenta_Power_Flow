@@ -26,8 +26,7 @@ import matplotlib.cm as cm
 import networkx as nx
 
 from loadflow import (Network, Bus, Branch, compile_network, check_network,
-                      BusElem, GenElem, LoadElem, ShuntElem, LineElem, TrafoElem,
-                      zbase_ohm, IEEE9_REFERENCE)
+                      BusElem, GenElem, LoadElem, ShuntElem, LineElem, TrafoElem)
 
 st.set_page_config(page_title="Regim permanent — Load Flow", page_icon="⚡", layout="wide")
 st.title("⚡ Calcul de regim permanent — circulație de puteri")
@@ -37,77 +36,34 @@ st.title("⚡ Calcul de regim permanent — circulație de puteri")
 # Rețele predefinite, ca seturi de tabele (dataframe-uri pe tipuri de element)
 # ===========================================================================
 def empty_dfs():
-    bus = pd.DataFrame([
-        {"id": 1, "nume": "Nod 1", "Vbaza_kV": 110.0, "Vmin": 0.90, "Vmax": 1.10},
-        {"id": 2, "nume": "Nod 2", "Vbaza_kV": 110.0, "Vmin": 0.90, "Vmax": 1.10},
-    ])
-    gen = pd.DataFrame([{"bara": 1, "nume": "G1", "tip": "slack", "P_MW": 0.0,
-                         "Vset": 1.0, "Qmin_MVAr": -100.0, "Qmax_MVAr": 100.0}])
-    load = pd.DataFrame([{"bara": 2, "nume": "C2", "P_MW": 20.0, "Q_MVAr": 8.0}])
-    shunt = pd.DataFrame([{"bara": pd.NA, "nume": "", "Q_Mvar": 0.0}]).iloc[0:0]
-    line = pd.DataFrame([{"from": 1, "to": 2, "nume": "L1-2", "lungime_km": 10.0,
-                          "r_ohm_km": 0.12, "x_ohm_km": 0.40, "b_uS_km": 2.8,
-                          "I_adm_A": 600.0}])
-    trafo = pd.DataFrame([{"from": pd.NA, "to": pd.NA, "nume": "", "Sr_MVA": 40.0,
-                           "uk_%": 12.0, "Pcu_kW": 180.0, "raport": 1.0,
-                           "defazaj_deg": 0.0}]).iloc[0:0]
-    return dict(bus=bus, gen=gen, load=load, shunt=shunt, line=line, trafo=trafo)
-
-
-def ieee9_dfs():
-    """IEEE 9 Bus / WSCC exprimat în elemente fizice, exact ca în fișierul
-    PowerWorld al utilizatorului (export .AUX, citit ca text: tabelele
-    Bus/Gen/Load/Branch). Sarcini la barele 2, 3, 5, 6, 8; generatoarele de
-    la barele 2 și 3 au fiecare câte două unități (păstrate separat, ca în
-    sursă). Vbază: 16.5/18/13.8 kV la generatoare, 230 kV pe rețea.
-    Transformatoarele ridicătoare (4-1, 2-7, 9-3) au r=0, tap=1, fără defazaj.
-    Curentul admisibil al liniilor e o estimare (150/250/300 MVA la 230 kV,
-    după impedanța relativă) — fișierul sursă nu specifică limite termice."""
-    base = 100.0
-    busv = {1: 16.5, 2: 18.0, 3: 13.8, 4: 230, 5: 230, 6: 230, 7: 230, 8: 230, 9: 230}
-    names = {1: "Bus1", 2: "Bus 2", 3: "Bus 3", 4: "Bus 4", 5: "Bus 5",
-            6: "Bus 6", 7: "Bus 7", 8: "Bus 8", 9: "Bus 9"}
-    bus = pd.DataFrame([{"id": i, "nume": names[i], "Vbaza_kV": v, "Vmin": 0.9, "Vmax": 1.1}
-                        for i, v in busv.items()])
-    # bară, nume, tip, P [MW], Vset, Qmin, Qmax — două unități la barele 2 și 3,
-    # exact ca în fișierul sursă (PowerWorld le ține ca generatoare separate)
-    gens = [
-        (1, "G1",   "slack", 0.00000, 1.040, -9900.0, 9900.0),
-        (2, "G2-1", "PV",    79.74007, 1.025, -9900.0, 9900.0),
-        (2, "G2-2", "PV",    79.17780, 1.025, -9900.0, 9900.0),
-        (3, "G3-1", "PV",    51.45840, 1.025, -9900.0, 9900.0),
-        (3, "G3-2", "PV",    31.45840, 1.025, -9900.0, 9900.0),
-    ]
-    gen = pd.DataFrame([{"bara": b, "nume": n, "tip": t, "P_MW": p, "Vset": v,
-                         "Qmin_MVAr": qn, "Qmax_MVAr": qx} for b, n, t, p, v, qn, qx in gens])
-    ld = {2: (30.0, 10.0), 3: (30.0, 10.0), 5: (125.0, 50.0), 6: (90.0, 30.0), 8: (100.0, 35.0)}
-    load = pd.DataFrame([{"bara": b, "nume": f"C{b}", "P_MW": p, "Q_MVAr": q}
-                         for b, (p, q) in ld.items()])
-    shunt = pd.DataFrame([{"bara": pd.NA, "nume": "", "Q_Mvar": 0.0}]).iloc[0:0]
-    # (from, to, R, X, B, I_admisibil[A]) — I_admisibil e o ESTIMARE inginerească
-    # (fișierul sursă nu are limite definite), calibrată pe intervalul consacrat
-    # 150/250/300 MVA la 230 kV, atribuit după impedanța relativă a fiecărei linii.
-    linep = [(5, 4, 0.0100, 0.0680, 0.176, 750.0), (6, 4, 0.0170, 0.0920, 0.158, 625.0),
-             (7, 5, 0.0320, 0.1610, 0.306, 375.0), (9, 6, 0.0390, 0.1738, 0.358, 375.0),
-             (7, 8, 0.0085, 0.0576, 0.149, 750.0), (8, 9, 0.0119, 0.1008, 0.209, 625.0)]
-    rows = []
-    for f, t, Rp, Xp, Bp, i_adm in linep:
-        Zb = zbase_ohm(busv[f], base)
-        rows.append({"from": f, "to": t, "nume": f"{f}-{t}", "lungime_km": 1.0,
-                     "r_ohm_km": round(Rp * Zb, 5), "x_ohm_km": round(Xp * Zb, 5),
-                     "b_uS_km": round(Bp / Zb * 1e6, 5) if Zb else 0.0, "I_adm_A": i_adm})
-    line = pd.DataFrame(rows)
-    trd = [(4, 1, 0.0576), (2, 7, 0.0625), (9, 3, 0.0586)]
-    trafo = pd.DataFrame([{"from": f, "to": t, "nume": f"{f}-{t}", "Sr_MVA": 100.0,
-                           "uk_%": round(Xp * 100, 5), "Pcu_kW": 0.0, "raport": 1.0,
-                           "defazaj_deg": 0.0} for f, t, Xp in trd])
+    bus = pd.DataFrame(columns=["id", "nume", "Vbaza_kV", "Vmin", "Vmax"])
+    gen = pd.DataFrame(columns=["bara", "nume", "tip", "P_MW", "Vset",
+                                "Qmin_MVAr", "Qmax_MVAr"])
+    load = pd.DataFrame(columns=["bara", "nume", "P_MW", "Q_MVAr"])
+    shunt = pd.DataFrame(columns=["bara", "nume", "Q_Mvar"])
+    line = pd.DataFrame(columns=["from", "to", "nume", "lungime_km", "r_ohm_km",
+                                 "x_ohm_km", "b_uS_km", "I_adm_A"])
+    trafo = pd.DataFrame(columns=["from", "to", "nume", "Sr_MVA", "uk_%",
+                                  "Pcu_kW", "defazaj_deg"])
     return dict(bus=bus, gen=gen, load=load, shunt=shunt, line=line, trafo=trafo)
 
 
 NETWORKS = {
-    "— Rețea nouă (de la zero) —": (empty_dfs, None),
-    "IEEE 9 Bus (WSCC)":           (ieee9_dfs, IEEE9_REFERENCE),
+    "Rețea nouă": (empty_dfs, None),
 }
+
+
+EDITOR_WIDGET_KEYS = ("ed_bus", "ed_gen", "ed_load", "ed_shunt", "ed_line", "ed_trafo")
+
+
+def _clear_editor_widget_state():
+    """Șterge starea internă a tabelelor editabile (legată de `key`), ca la
+    următoarea randare să preia valorile proaspăt puse în st.session_state.df_*
+    în loc să rămână cu conținutul vechi (comportament implicit Streamlit:
+    un widget cu `key` își păstrează valoarea proprie, ignorând argumentul
+    transmis, odată ce a fost randat o dată)."""
+    for k in EDITOR_WIDGET_KEYS:
+        st.session_state.pop(k, None)
 
 
 def load_case(name):
@@ -115,6 +71,7 @@ def load_case(name):
     for k, v in dfs.items():
         st.session_state["df_" + k] = v.reset_index(drop=True)
     st.session_state.net_name = name
+    _clear_editor_widget_state()
 
 
 # ---------------------------------------------------------------------------
@@ -197,6 +154,28 @@ def save_network_to_disk(name: str, dfs: dict) -> str:
     return path
 
 
+# Coloane folosite azi de fiecare tabel — orice coloană din urmă (format vechi
+# de salvare) care nu mai apare aici e eliminată la încărcare, ca rețelele
+# salvate înainte de o schimbare de model să nu mai afișeze coloane scoase.
+CURRENT_COLUMNS = {
+    "bus": ["id", "nume", "Vbaza_kV", "Vmin", "Vmax"],
+    "gen": ["bara", "nume", "tip", "P_MW", "Vset", "Qmin_MVAr", "Qmax_MVAr"],
+    "load": ["bara", "nume", "P_MW", "Q_MVAr"],
+    "shunt": ["bara", "nume", "Q_Mvar"],
+    "line": ["from", "to", "nume", "lungime_km", "r_ohm_km", "x_ohm_km",
+             "b_uS_km", "I_adm_A"],
+    "trafo": ["from", "to", "nume", "Sr_MVA", "uk_%", "Pcu_kW", "defazaj_deg"],
+}
+
+
+def read_saved_file_bytes(name: str) -> bytes:
+    path = _saved_file_for(name)
+    if not path:
+        raise FileNotFoundError(f"Rețeaua salvată „{name}” nu a fost găsită.")
+    with open(path, "rb") as f:
+        return f.read()
+
+
 def load_network_from_disk(name: str) -> dict:
     path = _saved_file_for(name)
     if not path:
@@ -207,7 +186,14 @@ def load_network_from_disk(name: str) -> dict:
     for k in ELEMENT_KEYS:
         t = meta["tables"].get(k, {"columns": [], "rows": []})
         rows, cols = t.get("rows", []), t.get("columns", [])
-        dfs[k] = pd.DataFrame(rows) if rows else pd.DataFrame(columns=cols)
+        df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=cols)
+        # păstrez doar coloanele curente; adaug pe cele lipsă (rânduri vechi
+        # fără o coloană nouă) și le umplu cu gol, ca formatul să rămână complet
+        for c in CURRENT_COLUMNS[k]:
+            if c not in df.columns:
+                df[c] = pd.NA
+        df = df[CURRENT_COLUMNS[k]]
+        dfs[k] = df
     return dfs
 
 
@@ -224,10 +210,11 @@ def load_saved_case(name: str):
     for k, v in dfs.items():
         st.session_state["df_" + k] = v.reset_index(drop=True)
     st.session_state.net_name = name
+    _clear_editor_widget_state()
 
 
 if "df_bus" not in st.session_state:
-    load_case("— Rețea nouă (de la zero) —")
+    load_case("Rețea nouă")
 
 
 # ===========================================================================
@@ -450,12 +437,16 @@ with st.sidebar:
     saved_list = list_saved_networks()
     if saved_list:
         sel_saved = st.selectbox("Rețea salvată", saved_list, key="sel_saved_net")
-        sc1, sc2 = st.columns(2)
+        sc1, sc2, sc3 = st.columns(3)
         if sc1.button("📂 Încarcă", use_container_width=True):
             load_saved_case(sel_saved); st.rerun()
+        sc2.download_button(
+            "⬇ Export", data=read_saved_file_bytes(sel_saved),
+            file_name=_slug(sel_saved) + ".json", mime="application/json",
+            use_container_width=True)
         del_flag = "confirm_delete__" + sel_saved
         if not st.session_state.get(del_flag, False):
-            if sc2.button("🗑️ Șterge", use_container_width=True):
+            if sc3.button("🗑️ Șterge", use_container_width=True):
                 st.session_state[del_flag] = True
                 st.rerun()
         else:
@@ -465,7 +456,7 @@ with st.sidebar:
                 delete_network_from_disk(sel_saved)
                 st.session_state.pop(del_flag, None)
                 if st.session_state.net_name == sel_saved:
-                    load_case("— Rețea nouă (de la zero) —")
+                    load_case("Rețea nouă")
                 st.success(f"„{sel_saved}” a fost ștearsă.")
                 st.rerun()
             if dc2.button("Anulează", use_container_width=True):
@@ -563,7 +554,7 @@ with tabs[3]:
         })
 with tabs[4]:
     st.caption("Transformator: putere nominală Sr [MVA], tensiune de scurtcircuit uk [%], "
-               "pierderi în cupru Pcu [kW], raport de prize și defazaj [°].")
+               "pierderi în cupru Pcu [kW] și defazaj [°].")
     df_trafo = st.data_editor(
         st.session_state.df_trafo, num_rows="dynamic", use_container_width=True,
         key="ed_trafo",
@@ -574,7 +565,6 @@ with tabs[4]:
             "Sr_MVA":       NC("Sr [MVA]", help="Putere nominală"),
             "uk_%":         NC("uk [%]", help="Tensiunea de scurtcircuit"),
             "Pcu_kW":       NC("Pcu [kW]", help="Pierderi în cupru la sarcină nominală"),
-            "raport":       NC("Raport prize", help="1.0 = raport nominal"),
             "defazaj_deg":  NC("Defazaj [°]", help="0 pentru un transformator obișnuit"),
         })
 
@@ -585,7 +575,7 @@ st.markdown("**💾 Salvează rețeaua curentă**")
 sv1, sv2 = st.columns([3, 1])
 default_name = st.session_state.net_name if st.session_state.net_name not in NETWORKS else ""
 save_name = sv1.text_input("Nume pentru salvare", value=default_name,
-                           placeholder="ex: Rețea proiect licență",
+                           placeholder="Rețea",
                            label_visibility="collapsed")
 if sv2.button("💾 Salvează", use_container_width=True):
     nm = save_name.strip()
@@ -723,6 +713,7 @@ if gen_snapshot is not None and not gen_snapshot.empty:
         gen_rows.append({
             "Bară": bid, "Nume": r.get("nume", "") or "", "Tip": tip,
             "P [MW]": round(p_show, 2), "Q [MVAr]": round(q_show, 2),
+            "S [MVA]": round((p_show**2 + q_show**2)**0.5, 2),
             "Vset [u.r.]": round(_num(r.get("Vset"), 1.0), 4),
             "V [u.r.]": round(b.Vm, 4), "V [kV]": round(b.Vm_kv, 2),
             "Fază [°]": round(b.Va, 2),
@@ -732,6 +723,7 @@ gen_out = pd.DataFrame(gen_rows)
 load_out = pd.DataFrame([{
     "Nod": b.id, "Nume": b.name,
     "P [MW]": round(b.Pd * S, 2), "Q [MVAr]": round(b.Qd * S, 2),
+    "S [MVA]": round(((b.Pd * S)**2 + (b.Qd * S)**2)**0.5, 2),
     "V [u.r.]": round(b.Vm, 4), "V [kV]": round(b.Vm_kv, 2),
 } for b in res.buses if abs(b.Pd) > 1e-9 or abs(b.Qd) > 1e-9])
 
