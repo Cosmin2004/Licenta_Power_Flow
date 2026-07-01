@@ -1,0 +1,846 @@
+"""
+app.py — Interfață pentru calculul regimului permanent (load flow).
+
+Rulare:
+    pip install -r requirements.txt
+    streamlit run app.py
+
+Modelul de rețea e definit pe ELEMENTE, în unități fizice / nominale:
+bare, generatoare, sarcini, șunturi, linii (km, Ω/km, µS/km) și transformatoare
+(MVA, uk%, Pcu, raport, defazaj). Totul e convertit automat în u.r. și rezolvat
+prin Newton-Raphson. Rezultatele includ tensiuni (u.r. și kV), circulații,
+pierderi, curenți, încărcări raportate la limite și semnalarea suprasarcinilor /
+abaterilor de tensiune.
+"""
+
+import os
+import json
+import datetime
+import numpy as np
+import pandas as pd
+import streamlit as st
+import matplotlib.pyplot as plt
+import matplotlib as mpl
+import matplotlib.colors as mcolors
+import matplotlib.cm as cm
+import networkx as nx
+
+from loadflow import (Network, Bus, Branch, compile_network, check_network,
+                      BusElem, GenElem, LoadElem, ShuntElem, LineElem, TrafoElem,
+                      zbase_ohm, IEEE9_REFERENCE)
+
+st.set_page_config(page_title="Regim permanent — Load Flow", page_icon="⚡", layout="wide")
+st.title("⚡ Calcul de regim permanent — circulație de puteri")
+
+
+# ===========================================================================
+# Rețele predefinite, ca seturi de tabele (dataframe-uri pe tipuri de element)
+# ===========================================================================
+def empty_dfs():
+    bus = pd.DataFrame([
+        {"id": 1, "nume": "Nod 1", "Vbaza_kV": 110.0, "Vmin": 0.90, "Vmax": 1.10},
+        {"id": 2, "nume": "Nod 2", "Vbaza_kV": 110.0, "Vmin": 0.90, "Vmax": 1.10},
+    ])
+    gen = pd.DataFrame([{"bara": 1, "nume": "G1", "tip": "slack", "P_MW": 0.0,
+                         "Vset": 1.0, "Qmin_MVAr": -100.0, "Qmax_MVAr": 100.0}])
+    load = pd.DataFrame([{"bara": 2, "nume": "C2", "P_MW": 20.0, "Q_MVAr": 8.0}])
+    shunt = pd.DataFrame([{"bara": pd.NA, "nume": "", "Q_Mvar": 0.0}]).iloc[0:0]
+    line = pd.DataFrame([{"from": 1, "to": 2, "nume": "L1-2", "lungime_km": 10.0,
+                          "r_ohm_km": 0.12, "x_ohm_km": 0.40, "b_uS_km": 2.8,
+                          "I_adm_A": 600.0}])
+    trafo = pd.DataFrame([{"from": pd.NA, "to": pd.NA, "nume": "", "Sr_MVA": 40.0,
+                           "uk_%": 12.0, "Pcu_kW": 180.0, "raport": 1.0,
+                           "defazaj_deg": 0.0}]).iloc[0:0]
+    return dict(bus=bus, gen=gen, load=load, shunt=shunt, line=line, trafo=trafo)
+
+
+def ieee9_dfs():
+    """IEEE 9 Bus / WSCC exprimat în elemente fizice, exact ca în fișierul
+    PowerWorld al utilizatorului (export .AUX, citit ca text: tabelele
+    Bus/Gen/Load/Branch). Sarcini la barele 2, 3, 5, 6, 8; generatoarele de
+    la barele 2 și 3 au fiecare câte două unități (păstrate separat, ca în
+    sursă). Vbază: 16.5/18/13.8 kV la generatoare, 230 kV pe rețea.
+    Transformatoarele ridicătoare (4-1, 2-7, 9-3) au r=0, tap=1, fără defazaj.
+    Curentul admisibil al liniilor e o estimare (150/250/300 MVA la 230 kV,
+    după impedanța relativă) — fișierul sursă nu specifică limite termice."""
+    base = 100.0
+    busv = {1: 16.5, 2: 18.0, 3: 13.8, 4: 230, 5: 230, 6: 230, 7: 230, 8: 230, 9: 230}
+    names = {1: "Bus1", 2: "Bus 2", 3: "Bus 3", 4: "Bus 4", 5: "Bus 5",
+            6: "Bus 6", 7: "Bus 7", 8: "Bus 8", 9: "Bus 9"}
+    bus = pd.DataFrame([{"id": i, "nume": names[i], "Vbaza_kV": v, "Vmin": 0.9, "Vmax": 1.1}
+                        for i, v in busv.items()])
+    # bară, nume, tip, P [MW], Vset, Qmin, Qmax — două unități la barele 2 și 3,
+    # exact ca în fișierul sursă (PowerWorld le ține ca generatoare separate)
+    gens = [
+        (1, "G1",   "slack", 0.00000, 1.040, -9900.0, 9900.0),
+        (2, "G2-1", "PV",    79.74007, 1.025, -9900.0, 9900.0),
+        (2, "G2-2", "PV",    79.17780, 1.025, -9900.0, 9900.0),
+        (3, "G3-1", "PV",    51.45840, 1.025, -9900.0, 9900.0),
+        (3, "G3-2", "PV",    31.45840, 1.025, -9900.0, 9900.0),
+    ]
+    gen = pd.DataFrame([{"bara": b, "nume": n, "tip": t, "P_MW": p, "Vset": v,
+                         "Qmin_MVAr": qn, "Qmax_MVAr": qx} for b, n, t, p, v, qn, qx in gens])
+    ld = {2: (30.0, 10.0), 3: (30.0, 10.0), 5: (125.0, 50.0), 6: (90.0, 30.0), 8: (100.0, 35.0)}
+    load = pd.DataFrame([{"bara": b, "nume": f"C{b}", "P_MW": p, "Q_MVAr": q}
+                         for b, (p, q) in ld.items()])
+    shunt = pd.DataFrame([{"bara": pd.NA, "nume": "", "Q_Mvar": 0.0}]).iloc[0:0]
+    # (from, to, R, X, B, I_admisibil[A]) — I_admisibil e o ESTIMARE inginerească
+    # (fișierul sursă nu are limite definite), calibrată pe intervalul consacrat
+    # 150/250/300 MVA la 230 kV, atribuit după impedanța relativă a fiecărei linii.
+    linep = [(5, 4, 0.0100, 0.0680, 0.176, 750.0), (6, 4, 0.0170, 0.0920, 0.158, 625.0),
+             (7, 5, 0.0320, 0.1610, 0.306, 375.0), (9, 6, 0.0390, 0.1738, 0.358, 375.0),
+             (7, 8, 0.0085, 0.0576, 0.149, 750.0), (8, 9, 0.0119, 0.1008, 0.209, 625.0)]
+    rows = []
+    for f, t, Rp, Xp, Bp, i_adm in linep:
+        Zb = zbase_ohm(busv[f], base)
+        rows.append({"from": f, "to": t, "nume": f"{f}-{t}", "lungime_km": 1.0,
+                     "r_ohm_km": round(Rp * Zb, 5), "x_ohm_km": round(Xp * Zb, 5),
+                     "b_uS_km": round(Bp / Zb * 1e6, 5) if Zb else 0.0, "I_adm_A": i_adm})
+    line = pd.DataFrame(rows)
+    trd = [(4, 1, 0.0576), (2, 7, 0.0625), (9, 3, 0.0586)]
+    trafo = pd.DataFrame([{"from": f, "to": t, "nume": f"{f}-{t}", "Sr_MVA": 100.0,
+                           "uk_%": round(Xp * 100, 5), "Pcu_kW": 0.0, "raport": 1.0,
+                           "defazaj_deg": 0.0} for f, t, Xp in trd])
+    return dict(bus=bus, gen=gen, load=load, shunt=shunt, line=line, trafo=trafo)
+
+
+NETWORKS = {
+    "— Rețea nouă (de la zero) —": (empty_dfs, None),
+    "IEEE 9 Bus (WSCC)":           (ieee9_dfs, IEEE9_REFERENCE),
+}
+
+
+def load_case(name):
+    dfs = NETWORKS[name][0]()
+    for k, v in dfs.items():
+        st.session_state["df_" + k] = v.reset_index(drop=True)
+    st.session_state.net_name = name
+
+
+# ---------------------------------------------------------------------------
+# Rețele salvate de utilizator — persistă pe disc ca fișiere JSON, ca să
+# rămână disponibile și după ce închizi și redeschizi aplicația.
+# ---------------------------------------------------------------------------
+ELEMENT_KEYS = ("bus", "gen", "load", "shunt", "line", "trafo")
+
+
+def _saved_networks_dir():
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+    except NameError:
+        here = os.getcwd()
+    d = os.path.join(here, "retele_salvate")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _slug(name: str) -> str:
+    keep = "".join(c if c.isalnum() or c in " _-" else "_" for c in name).strip()
+    keep = keep.replace(" ", "_")
+    return keep or "retea"
+
+
+def _saved_file_for(name: str):
+    """Găsește fișierul salvat al cărui nume afișat se potrivește."""
+    d = _saved_networks_dir()
+    for fn in sorted(os.listdir(d)):
+        if not fn.endswith(".json"):
+            continue
+        path = os.path.join(d, fn)
+        try:
+            with open(path, encoding="utf-8") as f:
+                meta = json.load(f)
+        except Exception:
+            continue
+        if meta.get("name") == name:
+            return path
+    return None
+
+
+def list_saved_networks():
+    d = _saved_networks_dir()
+    out = []
+    for fn in sorted(os.listdir(d)):
+        if not fn.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(d, fn), encoding="utf-8") as f:
+                meta = json.load(f)
+            out.append(meta.get("name", fn[:-5]))
+        except Exception:
+            continue
+    return sorted(out)
+
+
+def save_network_to_disk(name: str, dfs: dict) -> str:
+    """Salvează tabelele curente sub un nume. Suprascrie dacă numele există deja."""
+    d = _saved_networks_dir()
+    payload = {
+        "name": name,
+        "saved_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "tables": {},
+    }
+    for k in ELEMENT_KEYS:
+        df = dfs[k]
+        clean = df.where(pd.notnull(df), None)
+        payload["tables"][k] = {
+            "columns": list(df.columns),
+            "rows": clean.to_dict(orient="records"),
+        }
+    # dacă numele exista deja sub alt fișier (schimbat slug-ul), curăț vechiul fișier
+    old = _saved_file_for(name)
+    path = os.path.join(d, _slug(name) + ".json")
+    if old and old != path:
+        os.remove(old)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    return path
+
+
+def load_network_from_disk(name: str) -> dict:
+    path = _saved_file_for(name)
+    if not path:
+        raise FileNotFoundError(f"Rețeaua salvată „{name}” nu a fost găsită.")
+    with open(path, encoding="utf-8") as f:
+        meta = json.load(f)
+    dfs = {}
+    for k in ELEMENT_KEYS:
+        t = meta["tables"].get(k, {"columns": [], "rows": []})
+        rows, cols = t.get("rows", []), t.get("columns", [])
+        dfs[k] = pd.DataFrame(rows) if rows else pd.DataFrame(columns=cols)
+    return dfs
+
+
+def delete_network_from_disk(name: str) -> bool:
+    path = _saved_file_for(name)
+    if path:
+        os.remove(path)
+        return True
+    return False
+
+
+def load_saved_case(name: str):
+    dfs = load_network_from_disk(name)
+    for k, v in dfs.items():
+        st.session_state["df_" + k] = v.reset_index(drop=True)
+    st.session_state.net_name = name
+
+
+if "df_bus" not in st.session_state:
+    load_case("— Rețea nouă (de la zero) —")
+
+
+# ===========================================================================
+# Construirea rețelei din tabele (elemente fizice -> model u.r.)
+# ===========================================================================
+def _num(v, d=0.0):
+    try:
+        if pd.isna(v):
+            return d
+        return float(v)
+    except Exception:
+        return d
+
+
+def build_network(dfs, base_mva):
+    buses = [BusElem(int(r["id"]), str(r.get("nume", "") or ""),
+                     _num(r.get("Vbaza_kV"), 110.0), _num(r.get("Vmin"), 0.90),
+                     _num(r.get("Vmax"), 1.10))
+             for _, r in dfs["bus"].iterrows() if not pd.isna(r.get("id"))]
+    gens = [GenElem(int(r["bara"]), str(r.get("nume", "") or ""),
+                    str(r.get("tip", "PV") or "PV"), _num(r.get("P_MW")),
+                    _num(r.get("Vset"), 1.0), _num(r.get("Qmin_MVAr"), -9999),
+                    _num(r.get("Qmax_MVAr"), 9999))
+            for _, r in dfs["gen"].iterrows() if not pd.isna(r.get("bara"))]
+    loads = [LoadElem(int(r["bara"]), str(r.get("nume", "") or ""),
+                      _num(r.get("P_MW")), _num(r.get("Q_MVAr")))
+             for _, r in dfs["load"].iterrows() if not pd.isna(r.get("bara"))]
+    shunts = [ShuntElem(int(r["bara"]), str(r.get("nume", "") or ""), _num(r.get("Q_Mvar")))
+              for _, r in dfs["shunt"].iterrows() if not pd.isna(r.get("bara"))]
+    lines = [LineElem(int(r["from"]), int(r["to"]), str(r.get("nume", "") or ""),
+                      _num(r.get("lungime_km"), 1.0), _num(r.get("r_ohm_km")),
+                      _num(r.get("x_ohm_km")), _num(r.get("b_uS_km")), _num(r.get("I_adm_A")))
+             for _, r in dfs["line"].iterrows() if not pd.isna(r.get("from")) and not pd.isna(r.get("to"))]
+    trafos = [TrafoElem(int(r["from"]), int(r["to"]), str(r.get("nume", "") or ""),
+                        _num(r.get("Sr_MVA"), 40.0), _num(r.get("uk_%"), 10.0),
+                        _num(r.get("Pcu_kW")), _num(r.get("raport"), 1.0),
+                        _num(r.get("defazaj_deg")))
+              for _, r in dfs["trafo"].iterrows() if not pd.isna(r.get("from")) and not pd.isna(r.get("to"))]
+    return compile_network(buses, gens, loads, shunts, lines, trafos, base_mva)
+
+
+# ===========================================================================
+# Desen
+# ===========================================================================
+def _layout(G):
+    if G.number_of_edges() == 0:
+        return nx.circular_layout(G)
+    try:
+        return nx.kamada_kawai_layout(G)
+    except Exception:
+        try:
+            return nx.spring_layout(G, seed=3, k=1.5, iterations=200)
+        except Exception:
+            return nx.circular_layout(G)
+
+
+def _is_trafo(br, busmap):
+    if abs(getattr(br, "tap", 1.0) - 1.0) > 1e-9 or abs(getattr(br, "phase_shift_deg", 0.0)) > 1e-9:
+        return True
+    bf, bt = busmap.get(br.from_bus), busmap.get(br.to_bus)
+    return bf is not None and bt is not None and abs(bf.Vbase_kv - bt.Vbase_kv) > 1e-9
+
+
+def _pos_extent(pos):
+    """Întinderea aproximativă a aranjamentului nodurilor, pentru a scala simbolurile."""
+    xs = [p[0] for p in pos.values()]
+    ys = [p[1] for p in pos.values()]
+    return max(max(xs) - min(xs), max(ys) - min(ys), 1e-6)
+
+
+def _draw_transformer_symbol(ax, pos, u, v, extent, color="#888"):
+    """Desenează simbolul simplificat de transformator (două cercuri suprapuse
+    cu terminale drepte la capete), orientat de-a lungul liniei dintre cele
+    două bare, la mijlocul laturii (u, v). Culoarea implicită coincide cu cea
+    a liniilor obișnuite, ca simbolul să se integreze vizual pe schemă."""
+    xu, yu = pos[u]
+    xv, yv = pos[v]
+    mx, my = (xu + xv) / 2.0, (yu + yv) / 2.0
+    dx, dy = xv - xu, yv - yu
+    length = float(np.hypot(dx, dy)) or 1.0
+    ux, uy = dx / length, dy / length     # versorul direcției liniei
+    r = 0.015 * extent
+    off = r * 0.85     # decalajul dintre centrele celor două cercuri
+    stub = r * 1.3      # lungimea terminalului drept la fiecare capăt
+
+    # terminale (linii drepte) la cele două capete ale simbolului, de-a
+    # lungul direcției liniei
+    for sign in (-1, 1):
+        p0 = (mx + sign * ux * (off + r), my + sign * uy * (off + r))
+        p1 = (mx + sign * ux * (off + r + stub), my + sign * uy * (off + r + stub))
+        ax.plot([p0[0], p1[0]], [p0[1], p1[1]],
+                color=color, linewidth=1.4, solid_capstyle="butt", zorder=5)
+
+    for sign in (-1, 1):
+        cx, cy = mx + sign * ux * off, my + sign * uy * off
+        ax.add_patch(plt.Circle((cx, cy), r, facecolor="white",
+                                edgecolor=color, linewidth=1.4, zorder=6))
+
+
+def _draw_legend_row(fig, text_left, text_right, title=None, y=0.945,
+                     fontsize=8.5, icon_color="#999", title_y=0.975,
+                     title_fontsize=14):
+    """Desenează, deasupra schemei: un titlu proeminent (ex. numele rețelei)
+    și, sub el, un rând de legendă subtil (text mic, gri) cu o pictogramă
+    reală de transformator (orizontală) inserată exact unde ar apărea
+    cuvântul din text. Poziția pictogramei se calculează din lățimea textului
+    randat (nu offset-uri fixe), ca să rămână aliniată indiferent de font."""
+    fig.subplots_adjust(top=0.87 if title else 0.90)
+    if title:
+        fig.text(0.04, title_y, title, fontsize=title_fontsize,
+                 fontweight="bold", va="center", ha="left", color="#1a1a1a")
+    left = fig.text(0.04, y, text_left, fontsize=fontsize, va="center",
+                    ha="left", color="#888")
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    bbox_fig = left.get_window_extent(renderer=renderer).transformed(fig.transFigure.inverted())
+    icon_w, icon_h = 0.032, 0.034
+    icon_x = bbox_fig.x1 + 0.005
+    iax = fig.add_axes([icon_x, y - icon_h / 2, icon_w, icon_h])
+    iax.set_xlim(-1.6, 1.6); iax.set_ylim(-1, 1)
+    iax.set_aspect("equal"); iax.axis("off"); iax.patch.set_alpha(0)
+    r, off, stub = 0.55, 0.55 * 0.85, 0.55 * 1.3
+    for sign in (-1, 1):
+        x0, x1 = sign * (off + r), sign * (off + r + stub)
+        iax.plot([x0, x1], [0, 0], color=icon_color, linewidth=1.1,
+                 solid_capstyle="butt", zorder=5)
+        iax.add_patch(plt.Circle((sign * off, 0), r, facecolor="white",
+                                 edgecolor=icon_color, linewidth=1.1, zorder=6))
+    fig.text(icon_x + icon_w + 0.004, y, text_right, fontsize=fontsize,
+             va="center", ha="left", color="#888")
+
+
+def draw_topology(net, name=None):
+    G = nx.Graph()
+    bm = {b.id: b for b in net.buses}
+    for b in net.buses:
+        G.add_node(b.id)
+    valid = [br for br in net.branches if br.from_bus in bm and br.to_bus in bm]
+    for br in valid:
+        G.add_edge(br.from_bus, br.to_bus)
+    pos = _layout(G)
+    extent = _pos_extent(pos)
+    fig, ax = plt.subplots(figsize=(7, 5.2))
+    nx.draw_networkx_edges(G, pos, ax=ax, width=2, edge_color="#888")
+    tr_e = [(b.from_bus, b.to_bus) for b in valid if b.kind == "trafo" or _is_trafo(b, bm)]
+    for u, v in tr_e:
+        _draw_transformer_symbol(ax, pos, u, v, extent)
+    tc = {"slack": "#4C78A8", "pv": "#54A24B", "pq": "#E45756"}
+    for typ, shp in {"slack": "s", "pv": "^", "pq": "o"}.items():
+        nodes = [b.id for b in net.buses if b.type.lower() == typ]
+        if nodes:
+            nx.draw_networkx_nodes(G, pos, nodelist=nodes, node_shape=shp, node_size=850,
+                                   node_color=tc[typ], edgecolors="black", linewidths=1.1, ax=ax)
+    nx.draw_networkx_labels(G, pos, {b.id: b.id for b in net.buses}, font_size=8,
+                            font_color="white", font_weight="bold", ax=ax)
+    ax.axis("off")
+    _draw_legend_row(fig, "▢ Nod de echilibru   △ PV   ○ PQ   ·  ", " transformator",
+                     title=name)
+    return fig
+
+
+def draw_results(net, res, name=None):
+    G = nx.Graph()
+    bm = {b.id: b for b in net.buses}
+    vmap = {b.id: b for b in res.buses}
+    for b in res.buses:
+        G.add_node(b.id)
+    for br in res.branches:
+        G.add_edge(br.from_bus, br.to_bus)
+    pos = _layout(G)
+    extent = _pos_extent(pos)
+    vms = np.array([vmap[n].Vm for n in G.nodes()])
+    norm = mcolors.Normalize(vmin=min(0.9, vms.min()), vmax=max(1.1, vms.max()))
+    cmap = mpl.colormaps["RdYlGn"]
+    fig, ax = plt.subplots(figsize=(7, 5.2))
+    nx.draw_networkx_edges(G, pos, ax=ax, width=1.8, edge_color="#888")
+    tr_e = [(b.from_bus, b.to_bus) for b in res.branches if _is_trafo(b, bm)]
+    for u, v in tr_e:
+        _draw_transformer_symbol(ax, pos, u, v, extent)
+    for typ, shp in {"slack": "s", "pv": "^", "pq": "o"}.items():
+        nodes = [n for n in G.nodes() if vmap[n].type.lower() == typ]
+        if nodes:
+            nx.draw_networkx_nodes(G, pos, nodelist=nodes, node_shape=shp, node_size=900,
+                                   node_color=[cmap(norm(vmap[n].Vm)) for n in nodes],
+                                   edgecolors="black", linewidths=1.1, ax=ax)
+    nx.draw_networkx_labels(G, pos, {n: f"{n}\n{vmap[n].Vm:.3f}" for n in G.nodes()}, font_size=7, ax=ax)
+    sm = cm.ScalarMappable(cmap=cmap, norm=norm); sm.set_array([])
+    fig.colorbar(sm, ax=ax, label="Tensiune [u.r.]", shrink=0.8)
+    ax.set_title(name or "", fontsize=14, fontweight="bold", loc="left", color="#1a1a1a")
+    ax.axis("off"); fig.tight_layout()
+    return fig
+
+
+def voltage_profile_fig(res):
+    fig, ax = plt.subplots(figsize=(5, 5.2))
+    names = [str(b.id) for b in res.buses]; vms = [b.Vm for b in res.buses]
+    colors = ["#2ca02c" if b.v_status == "ok" else "#d62728" for b in res.buses]
+    ax.barh(names, vms, color=colors)
+    ax.axvline(1.0, color="gray", ls="--", lw=1)
+    ax.set_xlim(min(0.85, min(vms) - 0.02), max(1.12, max(vms) + 0.02))
+    ax.set_xlabel("Tensiune [u.r.]"); ax.set_ylabel("Nod")
+    ax.set_title("Profil de tensiune")
+    ax.invert_yaxis(); fig.tight_layout()
+    return fig
+
+
+# ===========================================================================
+# Bara laterală
+# ===========================================================================
+with st.sidebar:
+    st.header("Rețea")
+    idx = list(NETWORKS).index(st.session_state.net_name) \
+        if st.session_state.net_name in NETWORKS else 0
+    chosen = st.selectbox("Rețea predefinită", list(NETWORKS.keys()), index=idx)
+    if st.button("↺ Încarcă rețeaua aleasă", use_container_width=True):
+        load_case(chosen); st.rerun()
+
+    st.divider()
+    st.header("💾 Rețelele mele salvate")
+    saved_list = list_saved_networks()
+    if saved_list:
+        sel_saved = st.selectbox("Rețea salvată", saved_list, key="sel_saved_net")
+        sc1, sc2 = st.columns(2)
+        if sc1.button("📂 Încarcă", use_container_width=True):
+            load_saved_case(sel_saved); st.rerun()
+        del_flag = "confirm_delete__" + sel_saved
+        if not st.session_state.get(del_flag, False):
+            if sc2.button("🗑️ Șterge", use_container_width=True):
+                st.session_state[del_flag] = True
+                st.rerun()
+        else:
+            st.warning(f"Ștergi definitiv „{sel_saved}”? Nu se poate anula.")
+            dc1, dc2 = st.columns(2)
+            if dc1.button("Da, șterge", type="primary", use_container_width=True):
+                delete_network_from_disk(sel_saved)
+                st.session_state.pop(del_flag, None)
+                if st.session_state.net_name == sel_saved:
+                    load_case("— Rețea nouă (de la zero) —")
+                st.success(f"„{sel_saved}” a fost ștearsă.")
+                st.rerun()
+            if dc2.button("Anulează", use_container_width=True):
+                st.session_state.pop(del_flag, None)
+                st.rerun()
+    else:
+        st.caption("Nu ai încă nicio rețea salvată. Salvează una din pagina "
+                   "principală, sub tabelele de elemente.")
+
+    st.divider()
+    st.header("Parametri de calcul")
+    base_mva = st.number_input("Putere de bază S_base [MVA]", 1.0, 10000.0, 100.0)
+    tol = st.select_slider("Toleranță", options=[1e-4, 1e-6, 1e-8, 1e-10], value=1e-8)
+    max_iter = st.slider("Iterații maxime", 5, 100, 30)
+    enforce_q = st.checkbox("Respectă limitele de Q la PV", value=False)
+
+
+# ===========================================================================
+# Pas 1 — Definirea elementelor
+# ===========================================================================
+st.subheader(f"1 · Elementele rețelei — {st.session_state.net_name}")
+
+# Etichetele de mai jos sunt doar pentru AFIȘARE (capete de tabel clare, cu
+# unități); numele intern al coloanelor (folosit de build_network și de
+# salvare/încărcare) rămâne neschimbat, deci nimic din logica de citire a
+# datelor nu depinde de aceste etichete.
+NC = st.column_config.NumberColumn
+TC = st.column_config.TextColumn
+
+st.markdown("**Bare (noduri)**")
+df_bus = st.data_editor(
+    st.session_state.df_bus, num_rows="dynamic", use_container_width=True,
+    key="ed_bus",
+    column_config={
+        "id":       NC("Nr. bară", help="Identificator unic al barei", format="%d"),
+        "nume":     TC("Nume", help="Etichetă opțională"),
+        "Vbaza_kV": NC("V bază [kV]", help="Tensiunea de bază a barei, linie-linie"),
+        "Vmin":     NC("V min [u.r.]", help="Limită inferioară de tensiune, pentru semnalare"),
+        "Vmax":     NC("V max [u.r.]", help="Limită superioară de tensiune, pentru semnalare"),
+    })
+
+tabs = st.tabs(["Generatoare", "Sarcini", "Șunturi", "Linii", "Transformatoare"])
+with tabs[0]:
+    st.caption("Tipul barei e dedus de aici: o bară cu generator **slack** devine "
+               "nod de echilibru, cu **PV** devine nod generator; restul sunt PQ.")
+    df_gen = st.data_editor(
+        st.session_state.df_gen, num_rows="dynamic", use_container_width=True,
+        key="ed_gen",
+        column_config={
+            "bara":       NC("Bară", help="Bara la care e conectat generatorul", format="%d"),
+            "nume":       TC("Nume"),
+            "tip":        st.column_config.SelectboxColumn(
+                "Tip", options=["slack", "PV"], required=True,
+                help="slack = nod de echilibru, PV = generator cu tensiune impusă"),
+            "P_MW":       NC("P [MW]", help="Putere activă generată"),
+            "Vset":       NC("V impus [u.r.]", help="Tensiunea impusă la bornele generatorului"),
+            "Qmin_MVAr":  NC("Q min [MVAr]", help="Limita inferioară de putere reactivă"),
+            "Qmax_MVAr":  NC("Q max [MVAr]", help="Limita superioară de putere reactivă"),
+        })
+with tabs[1]:
+    df_load = st.data_editor(
+        st.session_state.df_load, num_rows="dynamic", use_container_width=True,
+        key="ed_load",
+        column_config={
+            "bara":   NC("Bară", help="Bara la care e conectată sarcina", format="%d"),
+            "nume":   TC("Nume"),
+            "P_MW":   NC("P [MW]", help="Putere activă a sarcinii"),
+            "Q_MVAr": NC("Q [MVAr]", help="Putere reactivă a sarcinii"),
+        })
+with tabs[2]:
+    st.caption("Q_Mvar > 0 = baterie de condensatoare; < 0 = bobină de reactanță.")
+    df_shunt = st.data_editor(
+        st.session_state.df_shunt, num_rows="dynamic", use_container_width=True,
+        key="ed_shunt",
+        column_config={
+            "bara":    NC("Bară", help="Bara la care e conectat șuntul", format="%d"),
+            "nume":    TC("Nume"),
+            "Q_Mvar":  NC("Q [MVAr]", help="Putere reactivă la Vbază; +Q = condensator, −Q = bobină"),
+        })
+with tabs[3]:
+    st.caption("Linie: lungime [km], rezistență/reactanță [Ω/km], susceptanță [µS/km], "
+               "curent admisibil [A] (pentru încărcare).")
+    df_line = st.data_editor(
+        st.session_state.df_line, num_rows="dynamic", use_container_width=True,
+        key="ed_line",
+        column_config={
+            "from":        NC("De la (bară)", format="%d"),
+            "to":          NC("La (bară)", format="%d"),
+            "nume":        TC("Nume"),
+            "lungime_km":  NC("Lungime [km]"),
+            "r_ohm_km":    NC("R [Ω/km]", help="Rezistență serie pe unitatea de lungime"),
+            "x_ohm_km":    NC("X [Ω/km]", help="Reactanță serie pe unitatea de lungime"),
+            "b_uS_km":     NC("B [µS/km]", help="Susceptanță de încărcare pe unitatea de lungime"),
+            "I_adm_A":     NC("I admisibil [A]", help="Curent admisibil; 0 = fără limită"),
+        })
+with tabs[4]:
+    st.caption("Transformator: putere nominală Sr [MVA], tensiune de scurtcircuit uk [%], "
+               "pierderi în cupru Pcu [kW], raport de prize și defazaj [°].")
+    df_trafo = st.data_editor(
+        st.session_state.df_trafo, num_rows="dynamic", use_container_width=True,
+        key="ed_trafo",
+        column_config={
+            "from":         NC("De la (bară)", format="%d"),
+            "to":           NC("La (bară)", format="%d"),
+            "nume":         TC("Nume"),
+            "Sr_MVA":       NC("Sr [MVA]", help="Putere nominală"),
+            "uk_%":         NC("uk [%]", help="Tensiunea de scurtcircuit"),
+            "Pcu_kW":       NC("Pcu [kW]", help="Pierderi în cupru la sarcină nominală"),
+            "raport":       NC("Raport prize", help="1.0 = raport nominal"),
+            "defazaj_deg":  NC("Defazaj [°]", help="0 pentru un transformator obișnuit"),
+        })
+
+dfs = {"bus": df_bus, "gen": df_gen, "load": df_load,
+       "shunt": df_shunt, "line": df_line, "trafo": df_trafo}
+
+st.markdown("**💾 Salvează rețeaua curentă**")
+sv1, sv2 = st.columns([3, 1])
+default_name = st.session_state.net_name if st.session_state.net_name not in NETWORKS else ""
+save_name = sv1.text_input("Nume pentru salvare", value=default_name,
+                           placeholder="ex: Rețea proiect licență",
+                           label_visibility="collapsed")
+if sv2.button("💾 Salvează", use_container_width=True):
+    nm = save_name.strip()
+    if not nm:
+        st.warning("Dă un nume rețelei înainte de a o salva.")
+    elif nm in NETWORKS:
+        st.error("Acest nume e folosit de o rețea predefinită — alege altul.")
+    else:
+        save_network_to_disk(nm, dfs)
+        st.session_state.net_name = nm
+        st.success(f"Rețeaua „{nm}” a fost salvată și poate fi reîncărcată din "
+                   f"bara laterală.")
+        st.rerun()
+st.caption("Salvarea sub un nume deja folosit suprascrie versiunea anterioară. "
+           "Rețelele salvate rămân disponibile și după ce închizi aplicația.")
+
+
+# ===========================================================================
+# Schemă unifilară live + verificare
+# ===========================================================================
+st.subheader("Schemă unifilară și verificare")
+try:
+    net_prev = build_network(dfs, base_mva)
+    build_err = None
+except Exception as e:
+    net_prev, build_err = None, str(e)
+errs, warns = ([], [])
+if net_prev is not None:
+    errs, warns = check_network(net_prev)
+
+pv1, pv2 = st.columns([1.3, 1])
+with pv1:
+    if net_prev is not None and net_prev.buses:
+        st.pyplot(draw_topology(net_prev, name=st.session_state.net_name))
+    else:
+        st.info("Adaugă cel puțin o bară.")
+with pv2:
+    if build_err:
+        st.error(f"Date invalide: {build_err}")
+    if errs:
+        st.error("**De rezolvat:**\n" + "\n".join(f"- {e}" for e in errs))
+    if warns:
+        st.warning("**Avertismente:**\n" + "\n".join(f"- {w}" for w in warns))
+    if net_prev is not None and not build_err and not errs and not warns:
+        st.success("Rețea validă — gata de calcul.")
+
+
+# ===========================================================================
+# Pas 2 — Calcul
+# ===========================================================================
+st.subheader("2 · Calcul")
+cr, cc = st.columns([3, 1])
+run = cr.button("▶ Calculează regimul permanent", type="primary",
+                use_container_width=True, disabled=bool(errs or build_err))
+if cc.button("Șterge rezultatele", use_container_width=True):
+    for k in ("result", "result_net", "result_net_name", "result_base_mva"):
+        st.session_state.pop(k, None)
+    st.rerun()
+if errs or build_err:
+    st.caption("Butonul de calcul e dezactivat până rezolvi problemele de mai sus.")
+
+if run:
+    try:
+        net = build_network(dfs, base_mva)
+        res = net.solve(tol=tol, max_iter=max_iter, enforce_q_limits=enforce_q)
+    except Exception as e:
+        st.error(f"Eroare la calcul: {e}"); st.stop()
+    st.session_state.result = res
+    st.session_state.result_net = net
+    st.session_state.result_net_name = st.session_state.net_name
+    st.session_state.result_base_mva = base_mva
+    st.session_state.result_dfs = {k: v.copy() for k, v in dfs.items()}
+
+if "result" not in st.session_state:
+    st.info("Definește elementele, apoi apasă **Calculează regimul permanent**.")
+    st.stop()
+
+res = st.session_state.result
+net = st.session_state.result_net
+S = st.session_state.result_base_mva
+net_name = st.session_state.result_net_name
+result_dfs = st.session_state.get("result_dfs", {})
+
+if res.converged:
+    st.success(f"{res.message}  ·  {res.iterations} iterații  ·  "
+               f"nepotrivire max = {res.mismatch:.1e}  ·  rețea: {net_name}")
+else:
+    st.error(res.message + f"   (rețea: {net_name})")
+
+n_over = sum(1 for b in res.branches if b.overloaded)
+n_vlow = sum(1 for b in res.buses if b.v_status == "joasă")
+n_vhigh = sum(1 for b in res.buses if b.v_status == "înaltă")
+
+# tabele
+bus_out = pd.DataFrame([{
+    "Nod": b.id, "Nume": b.name, "Tip": b.type, "V [u.r.]": round(b.Vm, 4),
+    "V [kV]": round(b.Vm_kv, 2), "Fază [°]": round(b.Va, 2), "Stare V": b.v_status,
+    "Pg [MW]": round(b.Pg * S, 2), "Qg [MVAr]": round(b.Qg * S, 2),
+    "Pd [MW]": round(b.Pd * S, 2), "Qd [MVAr]": round(b.Qd * S, 2),
+} for b in res.buses])
+
+bus_map = {b.id: b for b in res.buses}
+gen_snapshot = result_dfs.get("gen")
+gen_rows = []
+gen_has_multi = False
+if gen_snapshot is not None and not gen_snapshot.empty:
+    bus_p_sum = {}
+    for _, r in gen_snapshot.iterrows():
+        if pd.isna(r.get("bara")):
+            continue
+        bid = int(r["bara"])
+        bus_p_sum[bid] = bus_p_sum.get(bid, 0.0) + _num(r.get("P_MW"))
+    bus_unit_count = {}
+    for _, r in gen_snapshot.iterrows():
+        if pd.isna(r.get("bara")):
+            continue
+        bid = int(r["bara"])
+        bus_unit_count[bid] = bus_unit_count.get(bid, 0) + 1
+    for _, r in gen_snapshot.iterrows():
+        if pd.isna(r.get("bara")):
+            continue
+        bid = int(r["bara"])
+        b = bus_map.get(bid)
+        if b is None:
+            continue
+        tip = str(r.get("tip", "") or "")
+        p_unit = _num(r.get("P_MW"))
+        if tip.lower() == "slack":
+            p_show, q_show = b.Pg * S, b.Qg * S
+        else:
+            share = (p_unit / bus_p_sum[bid]) if bus_p_sum.get(bid) else 0.0
+            p_show, q_show = p_unit, b.Qg * S * share
+        if bus_unit_count.get(bid, 1) > 1:
+            gen_has_multi = True
+        gen_rows.append({
+            "Bară": bid, "Nume": r.get("nume", "") or "", "Tip": tip,
+            "P [MW]": round(p_show, 2), "Q [MVAr]": round(q_show, 2),
+            "Vset [u.r.]": round(_num(r.get("Vset"), 1.0), 4),
+            "V [u.r.]": round(b.Vm, 4), "V [kV]": round(b.Vm_kv, 2),
+            "Fază [°]": round(b.Va, 2),
+        })
+gen_out = pd.DataFrame(gen_rows)
+
+load_out = pd.DataFrame([{
+    "Nod": b.id, "Nume": b.name,
+    "P [MW]": round(b.Pd * S, 2), "Q [MVAr]": round(b.Qd * S, 2),
+    "V [u.r.]": round(b.Vm, 4), "V [kV]": round(b.Vm_kv, 2),
+} for b in res.buses if abs(b.Pd) > 1e-9 or abs(b.Qd) > 1e-9])
+
+def _branch_row(b):
+    return {
+        "Latura": b.name,
+        "P_from [MW]": round(b.P_from * S, 2), "Q_from [MVAr]": round(b.Q_from * S, 2),
+        "S [MVA]": round(b.loading * S, 2),
+        "I_from [A]": round(b.I_from_a, 1), "I_to [A]": round(b.I_to_a, 1),
+        "ΔP [MW]": round(b.P_loss * S, 3), "ΔQ [MVAr]": round(b.Q_loss * S, 3),
+        "ΔV [kV]": (round(b.dV_kv, 3) if b.dV_kv == b.dV_kv else None),
+        "Încărcare [%]": round(b.loading_pct, 1) if b.loading_pct else None,
+        "Suprasarcină": "DA" if b.overloaded else "",
+    }
+
+line_out = pd.DataFrame([_branch_row(b) for b in res.branches if b.kind != "trafo"])
+trafo_rows = []
+for b in res.branches:
+    if b.kind == "trafo":
+        row = _branch_row(b)
+        row["Raport"] = round(b.tap, 4)
+        trafo_rows.append(row)
+trafo_out = pd.DataFrame(trafo_rows)
+
+br_out = pd.DataFrame([{"Latura": b.name, "Tip": b.kind, **_branch_row(b)}
+                       for b in res.branches])
+
+
+# ===========================================================================
+# Pas 3 — Rezultate pe tab-uri
+# ===========================================================================
+st.subheader("3 · Rezultate")
+labels = ["Sinteză", "Noduri", "Generatoare", "Sarcini", "Linii", "Transformatoare", "Export"]
+T = dict(zip(labels, st.tabs(labels)))
+
+with T["Sinteză"]:
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Generare", f"{res.total_gen_P*S:.1f} MW", f"{res.total_gen_Q*S:.1f} MVAr")
+    m2.metric("Sarcină", f"{res.total_load_P*S:.1f} MW", f"{res.total_load_Q*S:.1f} MVAr")
+    m3.metric("Pierderi", f"{res.total_loss_P*S:.2f} MW", f"{res.total_loss_Q*S:.2f} MVAr")
+    m4.metric("Suprasarcini / abateri V", f"{n_over} laturi", f"{n_vlow+n_vhigh} noduri")
+    if n_over or n_vlow or n_vhigh:
+        msg = []
+        if n_over: msg.append(f"{n_over} laturi suprasolicitate (>100%)")
+        if n_vlow: msg.append(f"{n_vlow} noduri sub Vmin")
+        if n_vhigh: msg.append(f"{n_vhigh} noduri peste Vmax")
+        st.warning("Atenție: " + ", ".join(msg) + ".")
+    g1, g2 = st.columns([1.3, 1])
+    with g1:
+        st.pyplot(draw_results(net, res, name=net_name))
+    with g2:
+        st.pyplot(voltage_profile_fig(res))
+
+with T["Noduri"]:
+    st.caption("„Stare V\": ok / joasă (< Vmin) / înaltă (> Vmax).")
+    st.dataframe(bus_out, use_container_width=True, hide_index=True)
+
+with T["Generatoare"]:
+    if gen_out.empty:
+        st.info("Rețeaua nu are generatoare definite.")
+    else:
+        st.caption("Fiecare rând e o unitate generatoare individuală. „P\" e cel impus "
+                   "la calcul (pentru slack, cel rezultat). „Q\" e rezultatul solverului "
+                   "la bară" + (", distribuit proporțional cu P între unitățile de pe "
+                   "aceeași bară" if gen_has_multi else "") + ".")
+        st.dataframe(gen_out, use_container_width=True, hide_index=True)
+
+with T["Sarcini"]:
+    if load_out.empty:
+        st.info("Rețeaua nu are sarcini definite.")
+    else:
+        st.dataframe(load_out, use_container_width=True, hide_index=True)
+
+with T["Linii"]:
+    if line_out.empty:
+        st.info("Rețeaua nu are linii.")
+    else:
+        st.caption("„S [MVA]\" = puterea aparentă efectivă pe linie (mereu calculată). "
+                   "„Încărcare [%]\" se raportează la curentul admisibil [A] introdus la "
+                   "linie; gol = fără limită definită pentru acea linie.")
+        st.dataframe(line_out, use_container_width=True, hide_index=True)
+        fig3, ax3 = plt.subplots(figsize=(9, 3.0))
+        ln = [b for b in res.branches if b.kind != "trafo"]
+        lab = [b.name for b in ln]; load = [b.loading_pct for b in ln]
+        cols = ["#d62728" if b.overloaded else "#1f77b4" for b in ln]
+        ax3.bar(lab, load, color=cols); ax3.axhline(100, color="gray", ls="--", lw=1)
+        ax3.set_ylabel("Încărcare [%]"); ax3.set_title("Încărcarea liniilor")
+        ax3.tick_params(axis="x", rotation=45); ax3.grid(axis="y", alpha=0.3); fig3.tight_layout()
+        st.pyplot(fig3)
+
+with T["Transformatoare"]:
+    if trafo_out.empty:
+        st.info("Rețeaua nu are transformatoare.")
+    else:
+        st.caption("Încărcarea e raportată la puterea nominală Sr [MVA]. "
+                   "„Raport\" = raportul de transformare folosit la calcul.")
+        st.dataframe(trafo_out, use_container_width=True, hide_index=True)
+        fig4, ax4 = plt.subplots(figsize=(9, 3.0))
+        tr = [b for b in res.branches if b.kind == "trafo"]
+        lab = [b.name for b in tr]; load = [b.loading_pct for b in tr]
+        cols = ["#d62728" if b.overloaded else "#1f77b4" for b in tr]
+        ax4.bar(lab, load, color=cols); ax4.axhline(100, color="gray", ls="--", lw=1)
+        ax4.set_ylabel("Încărcare [%]"); ax4.set_title("Încărcarea transformatoarelor")
+        ax4.tick_params(axis="x", rotation=45); ax4.grid(axis="y", alpha=0.3); fig4.tight_layout()
+        st.pyplot(fig4)
+
+with T["Export"]:
+    d1, d2 = st.columns(2)
+    d1.download_button("⬇ Noduri (CSV)", bus_out.to_csv(index=False).encode("utf-8"),
+                       "noduri.csv", "text/csv", use_container_width=True)
+    d2.download_button("⬇ Laturi (CSV)", br_out.to_csv(index=False).encode("utf-8"),
+                       "laturi.csv", "text/csv", use_container_width=True)
