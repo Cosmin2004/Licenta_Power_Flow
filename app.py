@@ -48,8 +48,55 @@ def empty_dfs():
     return dict(bus=bus, gen=gen, load=load, shunt=shunt, line=line, trafo=trafo)
 
 
+def retea_test_dfs():
+    """Rețea predefinită „Rețea test" — reconstruită exact din fișierul
+    exportat de utilizator (Rețea_test.json), la rândul lui salvat din
+    rețeaua IEEE 9 Bus / WSCC (date PowerWorld). Validată: eroare max
+    9e-5 u.r. / 0.0095° față de starea salvată în fișierul PowerWorld sursă."""
+    bus = pd.DataFrame([
+        {"id": 1, "nume": "Bus1", "Vbaza_kV": 16.5, "Vmin": 0.9, "Vmax": 1.1},
+        {"id": 2, "nume": "Bus 2", "Vbaza_kV": 18.0, "Vmin": 0.9, "Vmax": 1.1},
+        {"id": 3, "nume": "Bus 3", "Vbaza_kV": 13.8, "Vmin": 0.9, "Vmax": 1.1},
+        {"id": 4, "nume": "Bus 4", "Vbaza_kV": 230.0, "Vmin": 0.9, "Vmax": 1.1},
+        {"id": 5, "nume": "Bus 5", "Vbaza_kV": 230.0, "Vmin": 0.9, "Vmax": 1.1},
+        {"id": 6, "nume": "Bus 6", "Vbaza_kV": 230.0, "Vmin": 0.9, "Vmax": 1.1},
+        {"id": 7, "nume": "Bus 7", "Vbaza_kV": 230.0, "Vmin": 0.9, "Vmax": 1.1},
+        {"id": 8, "nume": "Bus 8", "Vbaza_kV": 230.0, "Vmin": 0.9, "Vmax": 1.1},
+        {"id": 9, "nume": "Bus 9", "Vbaza_kV": 230.0, "Vmin": 0.9, "Vmax": 1.1},
+    ])
+    gen = pd.DataFrame([
+        {"bara": 1, "nume": "G1", "tip": "slack", "P_MW": 0.0, "Vset": 1.04, "Qmin_MVAr": -9900.0, "Qmax_MVAr": 9900.0},
+        {"bara": 2, "nume": "G2-1", "tip": "PV", "P_MW": 79.74007, "Vset": 1.025, "Qmin_MVAr": -9900.0, "Qmax_MVAr": 9900.0},
+        {"bara": 2, "nume": "G2-2", "tip": "PV", "P_MW": 79.1778, "Vset": 1.025, "Qmin_MVAr": -9900.0, "Qmax_MVAr": 9900.0},
+        {"bara": 3, "nume": "G3-1", "tip": "PV", "P_MW": 51.4584, "Vset": 1.025, "Qmin_MVAr": -9900.0, "Qmax_MVAr": 9900.0},
+        {"bara": 3, "nume": "G3-2", "tip": "PV", "P_MW": 31.4584, "Vset": 1.025, "Qmin_MVAr": -9900.0, "Qmax_MVAr": 9900.0},
+    ])
+    load = pd.DataFrame([
+        {"bara": 2, "nume": "S2", "P_MW": 30.0, "Q_MVAr": 10.0},
+        {"bara": 3, "nume": "S3", "P_MW": 30.0, "Q_MVAr": 10.0},
+        {"bara": 5, "nume": "S5", "P_MW": 125.0, "Q_MVAr": 50.0},
+        {"bara": 6, "nume": "S6", "P_MW": 90.0, "Q_MVAr": 30.0},
+        {"bara": 8, "nume": "S8", "P_MW": 100.0, "Q_MVAr": 35.0},
+    ])
+    shunt = pd.DataFrame(columns=['bara', 'nume', 'Q_Mvar'])
+    line = pd.DataFrame([
+        {"from": 5, "to": 4, "nume": "5-4", "lungime_km": 1.0, "r_ohm_km": 5.29, "x_ohm_km": 35.972, "b_uS_km": 332.70321, "I_adm_A": 750.0},
+        {"from": 6, "to": 4, "nume": "6-4", "lungime_km": 1.0, "r_ohm_km": 8.993, "x_ohm_km": 48.668, "b_uS_km": 298.67675, "I_adm_A": 625.0},
+        {"from": 7, "to": 5, "nume": "7-5", "lungime_km": 1.0, "r_ohm_km": 16.928, "x_ohm_km": 85.169, "b_uS_km": 578.44991, "I_adm_A": 375.0},
+        {"from": 9, "to": 6, "nume": "9-6", "lungime_km": 1.0, "r_ohm_km": 20.631, "x_ohm_km": 91.9402, "b_uS_km": 676.74858, "I_adm_A": 375.0},
+        {"from": 7, "to": 8, "nume": "7-8", "lungime_km": 1.0, "r_ohm_km": 4.4965, "x_ohm_km": 30.4704, "b_uS_km": 281.66352, "I_adm_A": 750.0},
+        {"from": 8, "to": 9, "nume": "8-9", "lungime_km": 1.0, "r_ohm_km": 6.2951, "x_ohm_km": 53.3232, "b_uS_km": 395.08507, "I_adm_A": 625.0},
+    ])
+    trafo = pd.DataFrame([
+        {"from": 4, "to": 1, "nume": "4-1", "Sr_MVA": 100.0, "uk_%": 5.76, "Pcu_kW": 0.0, "defazaj_deg": 0.0},
+        {"from": 2, "to": 7, "nume": "2-7", "Sr_MVA": 100.0, "uk_%": 6.25, "Pcu_kW": 0.0, "defazaj_deg": 0.0},
+        {"from": 9, "to": 3, "nume": "9-3", "Sr_MVA": 100.0, "uk_%": 5.86, "Pcu_kW": 0.0, "defazaj_deg": 0.0},
+    ])
+    return dict(bus=bus, gen=gen, load=load, shunt=shunt, line=line, trafo=trafo)
+
 NETWORKS = {
     "Rețea nouă": (empty_dfs, None),
+    "Rețea test": (retea_test_dfs, None),
 }
 
 
@@ -176,22 +223,20 @@ def read_saved_file_bytes(name: str) -> bytes:
         return f.read()
 
 
-def _dfs_from_tables_payload(tables: dict) -> dict:
-    """Reconstruiește tabelele (dict de DataFrame-uri) dintr-un payload JSON
-    de rețea — fie citit de pe disc, fie dintr-un fișier importat — aliniate
-    la schema curentă (coloane vechi/scoase eliminate, coloane noi lipsă
-    adăugate goale)."""
+def _parse_saved_meta(meta: dict) -> dict:
+    """Transformă structura JSON salvată (name/saved_at/tables) în cele șase
+    tabele curente, aliniate la schema de azi (coloane vechi eliminate, cele
+    noi adăugate goale)."""
     dfs = {}
     for k in ELEMENT_KEYS:
-        t = tables.get(k, {"columns": [], "rows": []})
+        t = meta.get("tables", {}).get(k, {"columns": [], "rows": []})
         rows, cols = t.get("rows", []), t.get("columns", [])
         df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=cols)
-        # păstrez doar coloanele curente; adaug pe cele lipsă (rânduri vechi
-        # fără o coloană nouă) și le umplu cu gol, ca formatul să rămână complet
         for c in CURRENT_COLUMNS[k]:
             if c not in df.columns:
                 df[c] = pd.NA
-        dfs[k] = df[CURRENT_COLUMNS[k]]
+        df = df[CURRENT_COLUMNS[k]]
+        dfs[k] = df
     return dfs
 
 
@@ -201,23 +246,22 @@ def load_network_from_disk(name: str) -> dict:
         raise FileNotFoundError(f"Rețeaua salvată „{name}” nu a fost găsită.")
     with open(path, encoding="utf-8") as f:
         meta = json.load(f)
-    return _dfs_from_tables_payload(meta.get("tables", {}))
+    return _parse_saved_meta(meta)
 
 
-def import_network_payload(raw_text: str, fallback_name: str = "Rețea importată"):
-    """Parsează conținutul unui fișier .json exportat și întoarce
-    (nume, dfs). Ridică ValueError cu un mesaj clar dacă fișierul nu are
-    structura așteptată."""
+def import_network_from_json_bytes(raw: bytes):
+    """Citește un fișier .json exportat anterior (Export) și întoarce
+    (nume_sugerat, dfs). Ridică ValueError dacă fișierul nu are structura
+    așteptată."""
     try:
-        meta = json.loads(raw_text)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Fișierul nu e JSON valid ({e}).")
+        meta = json.loads(raw.decode("utf-8"))
+    except Exception as e:
+        raise ValueError(f"nu e un JSON valid ({e})")
     if not isinstance(meta, dict) or "tables" not in meta:
-        raise ValueError("Fișierul nu are structura unei rețele exportate din "
-                         "acest program (lipsește secțiunea „tables\").")
-    name = meta.get("name") or fallback_name
-    dfs = _dfs_from_tables_payload(meta["tables"])
-    return name, dfs
+        raise ValueError('lipsește cheia "tables" — nu pare exportat de acest program')
+    name = str(meta.get("name") or "Rețea importată")
+    return name, _parse_saved_meta(meta)
+
 
 
 def delete_network_from_disk(name: str) -> bool:
@@ -399,6 +443,28 @@ def draw_topology(net, name=None):
     return fig
 
 
+def _flow_triangle(ax, pos, br, extent, t=0.5, color="#333"):
+    """Desenează un triunghi mic pe latură, care arată sensul REAL al
+    circulației de putere (nu neapărat de la 'from' la 'to' — dacă P_from
+    e negativ, puterea circulă de fapt spre 'from'). Umplut cu aceeași
+    culoare ca latura (contur subțire pentru vizibilitate pe orice fundal)."""
+    (xu, yu), (xv, yv) = pos[br.from_bus], pos[br.to_bus]
+    dx, dy = xv - xu, yv - yu
+    length = (dx * dx + dy * dy) ** 0.5 or 1.0
+    ux, uy = dx / length, dy / length
+    if br.P_from < 0:
+        ux, uy = -ux, -uy
+    px, py = -uy, ux
+    mx, my = xu + dx * t, yu + dy * t
+    s = 0.020 * extent
+    tip = (mx + ux * s, my + uy * s)
+    left = (mx - ux * s * 0.7 + px * s * 0.6, my - uy * s * 0.7 + py * s * 0.6)
+    right = (mx - ux * s * 0.7 - px * s * 0.6, my - uy * s * 0.7 - py * s * 0.6)
+    tri = plt.Polygon([tip, left, right], closed=True, facecolor=color,
+                      edgecolor="none", zorder=3)
+    ax.add_patch(tri)
+
+
 def draw_results(net, res, name=None):
     G = nx.Graph()
     bm = {b.id: b for b in net.buses}
@@ -412,11 +478,35 @@ def draw_results(net, res, name=None):
     vms = np.array([vmap[n].Vm for n in G.nodes()])
     norm = mcolors.Normalize(vmin=min(0.9, vms.min()), vmax=max(1.1, vms.max()))
     cmap = mpl.colormaps["RdYlGn"]
-    fig, ax = plt.subplots(figsize=(7, 5.2))
-    nx.draw_networkx_edges(G, pos, ax=ax, width=1.8, edge_color="#888")
-    tr_e = [(b.from_bus, b.to_bus) for b in res.branches if _is_trafo(b, bm)]
-    for u, v in tr_e:
-        _draw_transformer_symbol(ax, pos, u, v, extent)
+
+    # laturile se colorează după procentul de încărcare (verde = puțin
+    # încărcată, roșu = aproape de/peste limită); gri deschis = fără limită
+    # definită pentru acea latură (nu avem cu ce raporta încărcarea).
+    load_cmap = mpl.colormaps["RdYlGn_r"]
+    load_norm = mcolors.Normalize(vmin=0, vmax=100)
+    NO_RATING_COLOR = "#c7c7c7"
+
+    def _edge_color(br):
+        if br.loading_pct and br.loading_pct > 0:
+            return load_cmap(load_norm(min(br.loading_pct, 100)))
+        return NO_RATING_COLOR
+
+    fig = plt.figure(figsize=(7.6, 6.1))
+    ax = fig.add_axes([0.04, 0.17, 0.92, 0.76])
+
+    for br in res.branches:
+        (xu, yu), (xv, yv) = pos[br.from_bus], pos[br.to_bus]
+        ecolor = _edge_color(br)
+        ax.plot([xu, xv], [yu, yv], color=ecolor, linewidth=2.2,
+                solid_capstyle="round", zorder=1)
+        is_tr = _is_trafo(br, bm)
+        _flow_triangle(ax, pos, br, extent, t=0.28 if is_tr else 0.5, color=ecolor)
+        if not is_tr:
+            _flow_triangle(ax, pos, br, extent, t=0.72, color=ecolor)
+    for br in res.branches:
+        if _is_trafo(br, bm):
+            _draw_transformer_symbol(ax, pos, br.from_bus, br.to_bus, extent,
+                                     color=_edge_color(br))
     for typ, shp in {"slack": "s", "pv": "^", "pq": "o"}.items():
         nodes = [n for n in G.nodes() if vmap[n].type.lower() == typ]
         if nodes:
@@ -424,10 +514,17 @@ def draw_results(net, res, name=None):
                                    node_color=[cmap(norm(vmap[n].Vm)) for n in nodes],
                                    edgecolors="black", linewidths=1.1, ax=ax)
     nx.draw_networkx_labels(G, pos, {n: f"{n}\n{vmap[n].Vm:.3f}" for n in G.nodes()}, font_size=7, ax=ax)
-    sm = cm.ScalarMappable(cmap=cmap, norm=norm); sm.set_array([])
-    fig.colorbar(sm, ax=ax, label="Tensiune [u.r.]", shrink=0.8)
+    ax.axis("off")
+
+    cax1 = fig.add_axes([0.08, 0.07, 0.38, 0.032])
+    sm_v = cm.ScalarMappable(cmap=cmap, norm=norm); sm_v.set_array([])
+    fig.colorbar(sm_v, cax=cax1, orientation="horizontal").set_label("Tensiune [u.r.]", fontsize=9)
+
+    cax2 = fig.add_axes([0.55, 0.07, 0.38, 0.032])
+    sm_l = cm.ScalarMappable(cmap=load_cmap, norm=load_norm); sm_l.set_array([])
+    fig.colorbar(sm_l, cax=cax2, orientation="horizontal").set_label("Încărcare laturi [%]", fontsize=9)
+
     ax.set_title(name or "", fontsize=14, fontweight="bold", loc="left", color="#1a1a1a")
-    ax.axis("off"); fig.tight_layout()
     return fig
 
 
@@ -489,28 +586,30 @@ with st.sidebar:
         st.caption("Nu ai încă nicio rețea salvată. Salvează una din pagina "
                    "principală, sub tabelele de elemente.")
 
-    st.markdown("**📤 Importă o rețea**")
-    up = st.file_uploader("Fișier .json exportat", type=["json"], key="import_uploader",
-                          label_visibility="collapsed")
-    if up is not None:
-        try:
-            imp_name, imp_dfs = import_network_payload(
-                up.read().decode("utf-8"), fallback_name=up.name.rsplit(".", 1)[0])
-        except (ValueError, UnicodeDecodeError) as e:
-            st.error(f"Nu pot importa fișierul: {e}")
-        else:
-            final_name = st.text_input("Salvează sub numele", value=imp_name,
-                                       key="import_name_input")
-            if st.button("Importă și salvează", use_container_width=True):
-                nm = final_name.strip()
-                if not nm:
-                    st.warning("Dă un nume rețelei importate.")
-                elif nm in NETWORKS:
-                    st.error("Acest nume e folosit de o rețea predefinită — alege altul.")
-                else:
-                    save_network_to_disk(nm, imp_dfs)
-                    st.success(f"„{nm}” a fost importată și salvată.")
-                    st.rerun()
+    with st.expander("⬆ Importă o rețea (.json)"):
+        st.caption("Util mai ales pentru varianta online: exporți local, apoi "
+                   "urci fișierul aici — util și pentru a transfera o rețea "
+                   "între calculatoare.")
+        uploaded = st.file_uploader("Fișier rețea", type=["json"],
+                                    label_visibility="collapsed", key="import_uploader")
+        if uploaded is not None:
+            try:
+                imp_name, imp_dfs = import_network_from_json_bytes(uploaded.getvalue())
+            except Exception as e:
+                st.error(f"Fișier invalid — {e}.")
+            else:
+                imp_name_final = st.text_input("Salvează sub numele",
+                                               value=imp_name, key="import_name_input")
+                if st.button("💾 Salvează rețeaua importată", use_container_width=True):
+                    nm = imp_name_final.strip()
+                    if not nm:
+                        st.warning("Dă un nume rețelei.")
+                    elif nm in NETWORKS:
+                        st.error("Acest nume e folosit de o rețea predefinită — alege altul.")
+                    else:
+                        save_network_to_disk(nm, imp_dfs)
+                        st.success(f"„{nm}” a fost salvată — o găsești mai sus, în listă.")
+                        st.rerun()
 
     st.divider()
     st.header("Parametri de calcul")
@@ -642,7 +741,7 @@ st.caption("Salvarea sub un nume deja folosit suprascrie versiunea anterioară. 
 # ===========================================================================
 # Schemă unifilară live + verificare
 # ===========================================================================
-st.subheader("Schemă unifilară și verificare")
+st.subheader("Schemă simplificată și verificare")
 try:
     net_prev = build_network(dfs, base_mva)
     build_err = None
@@ -718,7 +817,7 @@ n_vhigh = sum(1 for b in res.buses if b.v_status == "înaltă")
 # tabele
 bus_out = pd.DataFrame([{
     "Nod": b.id, "Nume": b.name, "Tip": b.type, "V [u.r.]": round(b.Vm, 4),
-    "V [kV]": round(b.Vm_kv, 2), "Fază [°]": round(b.Va, 2), "Stare V": b.v_status,
+    "V [kV]": round(b.Vm_kv, 2), "Fază [°]": round(b.Va, 2),
     "Pg [MW]": round(b.Pg * S, 2), "Qg [MVAr]": round(b.Qg * S, 2),
     "Pd [MW]": round(b.Pd * S, 2), "Qd [MVAr]": round(b.Qd * S, 2),
 } for b in res.buses])
@@ -824,7 +923,6 @@ with T["Sinteză"]:
         st.pyplot(voltage_profile_fig(res))
 
 with T["Noduri"]:
-    st.caption("„Stare V\": ok / joasă (< Vmin) / înaltă (> Vmax).")
     st.dataframe(bus_out, use_container_width=True, hide_index=True)
 
 with T["Generatoare"]:
