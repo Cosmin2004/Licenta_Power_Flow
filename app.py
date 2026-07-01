@@ -176,15 +176,14 @@ def read_saved_file_bytes(name: str) -> bytes:
         return f.read()
 
 
-def load_network_from_disk(name: str) -> dict:
-    path = _saved_file_for(name)
-    if not path:
-        raise FileNotFoundError(f"Rețeaua salvată „{name}” nu a fost găsită.")
-    with open(path, encoding="utf-8") as f:
-        meta = json.load(f)
+def _dfs_from_tables_payload(tables: dict) -> dict:
+    """Reconstruiește tabelele (dict de DataFrame-uri) dintr-un payload JSON
+    de rețea — fie citit de pe disc, fie dintr-un fișier importat — aliniate
+    la schema curentă (coloane vechi/scoase eliminate, coloane noi lipsă
+    adăugate goale)."""
     dfs = {}
     for k in ELEMENT_KEYS:
-        t = meta["tables"].get(k, {"columns": [], "rows": []})
+        t = tables.get(k, {"columns": [], "rows": []})
         rows, cols = t.get("rows", []), t.get("columns", [])
         df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=cols)
         # păstrez doar coloanele curente; adaug pe cele lipsă (rânduri vechi
@@ -192,9 +191,33 @@ def load_network_from_disk(name: str) -> dict:
         for c in CURRENT_COLUMNS[k]:
             if c not in df.columns:
                 df[c] = pd.NA
-        df = df[CURRENT_COLUMNS[k]]
-        dfs[k] = df
+        dfs[k] = df[CURRENT_COLUMNS[k]]
     return dfs
+
+
+def load_network_from_disk(name: str) -> dict:
+    path = _saved_file_for(name)
+    if not path:
+        raise FileNotFoundError(f"Rețeaua salvată „{name}” nu a fost găsită.")
+    with open(path, encoding="utf-8") as f:
+        meta = json.load(f)
+    return _dfs_from_tables_payload(meta.get("tables", {}))
+
+
+def import_network_payload(raw_text: str, fallback_name: str = "Rețea importată"):
+    """Parsează conținutul unui fișier .json exportat și întoarce
+    (nume, dfs). Ridică ValueError cu un mesaj clar dacă fișierul nu are
+    structura așteptată."""
+    try:
+        meta = json.loads(raw_text)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Fișierul nu e JSON valid ({e}).")
+    if not isinstance(meta, dict) or "tables" not in meta:
+        raise ValueError("Fișierul nu are structura unei rețele exportate din "
+                         "acest program (lipsește secțiunea „tables\").")
+    name = meta.get("name") or fallback_name
+    dfs = _dfs_from_tables_payload(meta["tables"])
+    return name, dfs
 
 
 def delete_network_from_disk(name: str) -> bool:
@@ -465,6 +488,29 @@ with st.sidebar:
     else:
         st.caption("Nu ai încă nicio rețea salvată. Salvează una din pagina "
                    "principală, sub tabelele de elemente.")
+
+    st.markdown("**📤 Importă o rețea**")
+    up = st.file_uploader("Fișier .json exportat", type=["json"], key="import_uploader",
+                          label_visibility="collapsed")
+    if up is not None:
+        try:
+            imp_name, imp_dfs = import_network_payload(
+                up.read().decode("utf-8"), fallback_name=up.name.rsplit(".", 1)[0])
+        except (ValueError, UnicodeDecodeError) as e:
+            st.error(f"Nu pot importa fișierul: {e}")
+        else:
+            final_name = st.text_input("Salvează sub numele", value=imp_name,
+                                       key="import_name_input")
+            if st.button("Importă și salvează", use_container_width=True):
+                nm = final_name.strip()
+                if not nm:
+                    st.warning("Dă un nume rețelei importate.")
+                elif nm in NETWORKS:
+                    st.error("Acest nume e folosit de o rețea predefinită — alege altul.")
+                else:
+                    save_network_to_disk(nm, imp_dfs)
+                    st.success(f"„{nm}” a fost importată și salvată.")
+                    st.rerun()
 
     st.divider()
     st.header("Parametri de calcul")
