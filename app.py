@@ -23,13 +23,14 @@ import matplotlib.pyplot as plt
 import matplotlib as mpl
 import matplotlib.colors as mcolors
 import matplotlib.cm as cm
+import matplotlib.ticker as mticker
 import networkx as nx
 
 from loadflow import (Network, Bus, Branch, compile_network, check_network,
                       BusElem, GenElem, LoadElem, ShuntElem, LineElem, TrafoElem)
 
-st.set_page_config(page_title="Regim permanent — Load Flow", page_icon="⚡", layout="wide")
-st.title("⚡ Calcul de regim permanent — circulație de puteri")
+st.set_page_config(page_title="Calcul Regim Permanent", page_icon="⚡", layout="wide")
+st.title("⚡ Calcul de regim permanent")
 
 
 # ===========================================================================
@@ -414,6 +415,15 @@ def _draw_legend_row(fig, text_left, text_right, title=None, y=0.945,
              va="center", ha="left", color="#888")
 
 
+def _draw_load_marker(ax, pos, bus_id, p_mw, extent, color="#555"):
+    """Marchează o bară cu sarcină: o săgeată mică în jos, cu puterea activă
+    consumată [MW], poziționată sub bară."""
+    x, y = pos[bus_id]
+    offset = 0.075 * extent
+    ax.annotate(f"↓ {p_mw:.0f} MW", xy=(x, y - offset), ha="center", va="top",
+               fontsize=6.5, color=color, zorder=4)
+
+
 def draw_topology(net, name=None):
     G = nx.Graph()
     bm = {b.id: b for b in net.buses}
@@ -437,6 +447,9 @@ def draw_topology(net, name=None):
                                    node_color=tc[typ], edgecolors="black", linewidths=1.1, ax=ax)
     nx.draw_networkx_labels(G, pos, {b.id: b.id for b in net.buses}, font_size=8,
                             font_color="white", font_weight="bold", ax=ax)
+    for b in net.buses:
+        if abs(b.Pd) > 1e-9 or abs(b.Qd) > 1e-9:
+            _draw_load_marker(ax, pos, b.id, b.Pd * net.base_mva, extent)
     ax.axis("off")
     _draw_legend_row(fig, "▢ Nod de echilibru   △ PV   ○ PQ   ·  ", " transformator",
                      title=name)
@@ -513,12 +526,17 @@ def draw_results(net, res, name=None):
             nx.draw_networkx_nodes(G, pos, nodelist=nodes, node_shape=shp, node_size=900,
                                    node_color=[cmap(norm(vmap[n].Vm)) for n in nodes],
                                    edgecolors="black", linewidths=1.1, ax=ax)
-    nx.draw_networkx_labels(G, pos, {n: f"{n}\n{vmap[n].Vm:.3f}" for n in G.nodes()}, font_size=7, ax=ax)
+    nx.draw_networkx_labels(G, pos, {n: f"{n}\n{vmap[n].Vm_kv:.1f} kV" for n in G.nodes()}, font_size=7, ax=ax)
+    for b in res.buses:
+        if abs(b.Pd) > 1e-9 or abs(b.Qd) > 1e-9:
+            _draw_load_marker(ax, pos, b.id, b.Pd * net.base_mva, extent)
     ax.axis("off")
 
     cax1 = fig.add_axes([0.08, 0.07, 0.38, 0.032])
     sm_v = cm.ScalarMappable(cmap=cmap, norm=norm); sm_v.set_array([])
-    fig.colorbar(sm_v, cax=cax1, orientation="horizontal").set_label("Tensiune noduri [u.r.]", fontsize=9)
+    cbar_v = fig.colorbar(sm_v, cax=cax1, orientation="horizontal")
+    cbar_v.ax.xaxis.set_major_formatter(mticker.PercentFormatter(xmax=1.0, decimals=0))
+    cbar_v.set_label("Tensiune noduri [%]", fontsize=9)
 
     cax2 = fig.add_axes([0.55, 0.07, 0.38, 0.032])
     sm_l = cm.ScalarMappable(cmap=load_cmap, norm=load_norm); sm_l.set_array([])
