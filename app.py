@@ -518,7 +518,7 @@ def draw_results(net, res, name=None):
 
     cax1 = fig.add_axes([0.08, 0.07, 0.38, 0.032])
     sm_v = cm.ScalarMappable(cmap=cmap, norm=norm); sm_v.set_array([])
-    fig.colorbar(sm_v, cax=cax1, orientation="horizontal").set_label("Tensiune [u.r.]", fontsize=9)
+    fig.colorbar(sm_v, cax=cax1, orientation="horizontal").set_label("Tensiune noduri [u.r.]", fontsize=9)
 
     cax2 = fig.add_axes([0.55, 0.07, 0.38, 0.032])
     sm_l = cm.ScalarMappable(cmap=load_cmap, norm=load_norm); sm_l.set_array([])
