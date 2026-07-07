@@ -15,6 +15,7 @@ abaterilor de tensiune.
 
 import os
 import json
+import hashlib
 import datetime
 import numpy as np
 import pandas as pd
@@ -145,6 +146,15 @@ def _slug(name: str) -> str:
     return keep or "retea"
 
 
+def _storage_filename(name: str) -> str:
+    """Nume de fișier pentru stocarea pe disc — include un scurt hash al
+    numelui complet, ca două nume diferite care „se curăță” la același slug
+    (ex. „Test!” și „Test?”) să nu ajungă în ACELAȘI fișier și să se
+    suprascrie silențios una pe alta."""
+    h = hashlib.md5(name.encode("utf-8")).hexdigest()[:8]
+    return f"{_slug(name)}_{h}"
+
+
 def _saved_file_for(name: str):
     """Găsește fișierul salvat al cărui nume afișat se potrivește."""
     d = _saved_networks_dir()
@@ -192,9 +202,9 @@ def save_network_to_disk(name: str, dfs: dict) -> str:
             "columns": list(df.columns),
             "rows": clean.to_dict(orient="records"),
         }
-    # dacă numele exista deja sub alt fișier (schimbat slug-ul), curăț vechiul fișier
+    # dacă numele exista deja sub alt fișier, curăț vechiul fișier
     old = _saved_file_for(name)
-    path = os.path.join(d, _slug(name) + ".json")
+    path = os.path.join(d, _storage_filename(name) + ".json")
     if old and old != path:
         os.remove(old)
     with open(path, "w", encoding="utf-8") as f:
@@ -435,6 +445,7 @@ def draw_topology(net, name=None):
     pos = _layout(G)
     extent = _pos_extent(pos)
     fig, ax = plt.subplots(figsize=(7, 5.2))
+    ax.set_aspect("equal", adjustable="datalim")
     nx.draw_networkx_edges(G, pos, ax=ax, width=2, edge_color="#888")
     tr_e = [(b.from_bus, b.to_bus) for b in valid if b.kind == "trafo" or _is_trafo(b, bm)]
     for u, v in tr_e:
@@ -506,6 +517,7 @@ def draw_results(net, res, name=None):
 
     fig = plt.figure(figsize=(7.6, 6.1))
     ax = fig.add_axes([0.04, 0.17, 0.92, 0.76])
+    ax.set_aspect("equal", adjustable="datalim")
 
     for br in res.branches:
         (xu, yu), (xv, yv) = pos[br.from_bus], pos[br.to_bus]
@@ -829,12 +841,15 @@ else:
     st.error(res.message + f"   (rețea: {net_name})")
 
 n_over = sum(1 for b in res.branches if b.overloaded)
+any_q_limited = any(b.q_limited for b in res.buses)
 n_vlow = sum(1 for b in res.buses if b.v_status == "joasă")
 n_vhigh = sum(1 for b in res.buses if b.v_status == "înaltă")
 
 # tabele
 bus_out = pd.DataFrame([{
-    "Nod": b.id, "Nume": b.name, "Tip": b.type, "V [u.r.]": round(b.Vm, 4),
+    "Nod": b.id, "Nume": b.name,
+    "Tip": b.type + (" (limitat Q)" if b.q_limited else ""),
+    "V [u.r.]": round(b.Vm, 4),
     "V [kV]": round(b.Vm_kv, 2), "Fază [°]": round(b.Va, 2),
     "Pg [MW]": round(b.Pg * S, 2), "Qg [MVAr]": round(b.Qg * S, 2),
     "Pd [MW]": round(b.Pd * S, 2), "Qd [MVAr]": round(b.Qd * S, 2),
@@ -866,15 +881,22 @@ if gen_snapshot is not None and not gen_snapshot.empty:
             continue
         tip = str(r.get("tip", "") or "")
         p_unit = _num(r.get("P_MW"))
+        n_units = bus_unit_count.get(bid, 1)
         if tip.lower() == "slack":
             p_show, q_show = b.Pg * S, b.Qg * S
         else:
-            share = (p_unit / bus_p_sum[bid]) if bus_p_sum.get(bid) else 0.0
+            if bus_p_sum.get(bid):
+                share = p_unit / bus_p_sum[bid]
+            else:
+                # toate unitățile de pe bară au P=0 (ex. compensator sincron
+                # pur reactiv) — nu există bază de proporție, distribui egal
+                share = 1.0 / n_units if n_units else 0.0
             p_show, q_show = p_unit, b.Qg * S * share
-        if bus_unit_count.get(bid, 1) > 1:
+        if n_units > 1:
             gen_has_multi = True
         gen_rows.append({
-            "Bară": bid, "Nume": r.get("nume", "") or "", "Tip": tip,
+            "Bară": bid, "Nume": r.get("nume", "") or "",
+            "Tip": tip + (" (limitat Q)" if b.q_limited else ""),
             "P [MW]": round(p_show, 2), "Q [MVAr]": round(q_show, 2),
             "S [MVA]": round((p_show**2 + q_show**2)**0.5, 2),
             "Vset [u.r.]": round(_num(r.get("Vset"), 1.0), 4),
@@ -941,6 +963,9 @@ with T["Sinteză"]:
         st.pyplot(voltage_profile_fig(res))
 
 with T["Noduri"]:
+    if any_q_limited:
+        st.caption("„(limitat Q)” = generator PV care și-a atins limita de putere "
+                   "reactivă; tensiunea nu a mai putut fi menținută la Vset.")
     st.dataframe(bus_out, use_container_width=True, hide_index=True)
 
 with T["Generatoare"]:
@@ -950,7 +975,9 @@ with T["Generatoare"]:
         st.caption("Fiecare rând e o unitate generatoare individuală. „P\" e cel impus "
                    "la calcul (pentru slack, cel rezultat). „Q\" e rezultatul solverului "
                    "la bară" + (", distribuit proporțional cu P între unitățile de pe "
-                   "aceeași bară" if gen_has_multi else "") + ".")
+                   "aceeași bară (egal, dacă toate au P=0)" if gen_has_multi else "") +
+                   (". „(limitat Q)” = generator care și-a atins limita de reactiv "
+                    "— tensiunea nu a mai fost menținută la Vset" if any_q_limited else "") + ".")
         st.dataframe(gen_out, use_container_width=True, hide_index=True)
 
 with T["Sarcini"]:
