@@ -76,6 +76,9 @@ class BusResult:
     Vmin: float = 0.90      # limită inferioară (u.r.)
     Vmax: float = 1.10      # limită superioară (u.r.)
     v_status: str = "ok"    # "ok", "joasă" sau "înaltă"
+    q_limited: bool = False  # True dacă acest generator PV și-a atins limita
+                             # de Q în timpul calculului (tensiunea NU a fost
+                             # menținută la Vset; tip rămâne "PV" pentru afișare)
 
 
 @dataclass
@@ -200,6 +203,7 @@ class Network:
         converged = False
         iterations = 0
         mismatch = np.inf
+        q_limited = set()  # indicii barelor PV comutate la PQ (limită Q atinsă)
 
         # buclă externă pentru tratarea limitelor de Q la nodurile PV
         for _outer in range(20):
@@ -249,10 +253,12 @@ class Network:
                     btype[k] = "pq"
                     Qsp[k] = self.buses[k].Qmax - self.buses[k].Qd
                     changed = True
+                    q_limited.add(k)
                 elif Qgen_k < self.buses[k].Qmin - 1e-9:
                     btype[k] = "pq"
                     Qsp[k] = self.buses[k].Qmin - self.buses[k].Qd
                     changed = True
+                    q_limited.add(k)
             if not changed:
                 break
 
@@ -261,11 +267,11 @@ class Network:
         S = V * np.conj(Y @ V)
 
         return self._assemble_results(idx, Y, V, S, btype, slack,
-                                      converged, iterations, mismatch)
+                                      converged, iterations, mismatch, q_limited)
 
     # --- compunerea rezultatelor -------------------------------------------
     def _assemble_results(self, idx, Y, V, S, btype, slack,
-                          converged, iterations, mismatch) -> LoadFlowResult:
+                          converged, iterations, mismatch, q_limited=frozenset()) -> LoadFlowResult:
         n = len(self.buses)
         Vm = np.abs(V)
         Va_deg = np.rad2deg(np.angle(V))
@@ -281,11 +287,9 @@ class Network:
                 Pg = b.Pg
                 Qg = Qinj + b.Qd
             else:  # PQ (inclusiv PV comutat din cauza limitelor de Q)
-                # dacă nodul a fost convertit, păstrăm generarea fixată
-                Pg = b.Pg if b.type.lower() in ("pv", "slack") else 0.0
+                # dacă nodul a fost convertit, păstrăm generarea activă fixată
+                Pg = b.Pg
                 Qg = Qinj + b.Qd
-                if b.type.lower() == "pq":
-                    Pg = b.Pg
             v_status = "ok"
             if Vm[k] < b.Vmin - 1e-9:
                 v_status = "joasă"
@@ -296,7 +300,8 @@ class Network:
                 Vm=Vm[k], Va=Va_deg[k],
                 Vm_kv=Vm[k] * b.Vbase_kv, Vbase_kv=b.Vbase_kv,
                 Pg=Pg, Qg=Qg, Pd=b.Pd, Qd=b.Qd,
-                Vmin=b.Vmin, Vmax=b.Vmax, v_status=v_status))
+                Vmin=b.Vmin, Vmax=b.Vmax, v_status=v_status,
+                q_limited=(k in q_limited)))
             tot_gen_P += Pg
             tot_gen_Q += Qg
             tot_load_P += b.Pd
@@ -685,6 +690,15 @@ class TrafoElem:
     shift_deg: float = 0.0
 
 
+def _get_bus(bmap, bus_id, elem_kind, elem_name=""):
+    """Caută bara `bus_id` în bmap; ridică o eroare clară (nu KeyError brut)
+    dacă elementul referă o bară care nu există în rețea."""
+    if bus_id not in bmap:
+        label = f" „{elem_name}”" if elem_name else ""
+        raise ValueError(f"{elem_kind}{label} referă bara {bus_id}, care nu există în rețea.")
+    return bmap[bus_id]
+
+
 def compile_network(bus_elems, gens=(), loads=(), shunts=(), lines=(), trafos=(),
                     base_mva=100.0) -> Network:
     """Compilează elementele în unități fizice într-un model u.r. gata de calcul.
@@ -697,11 +711,14 @@ def compile_network(bus_elems, gens=(), loads=(), shunts=(), lines=(), trafos=()
         net.add_bus(b)
         bmap[be.id] = b
     for ld in loads:
-        b = bmap[ld.bus]; b.Pd += ld.P_mw / base_mva; b.Qd += ld.Q_mvar / base_mva
+        b = _get_bus(bmap, ld.bus, "Sarcina", ld.name)
+        b.Pd += ld.P_mw / base_mva; b.Qd += ld.Q_mvar / base_mva
     for sh in shunts:
-        bmap[sh.bus].Bs += sh.Q_mvar / base_mva
+        b = _get_bus(bmap, sh.bus, "Șuntul", sh.name)
+        b.Bs += sh.Q_mvar / base_mva
     for g in gens:
-        b = bmap[g.bus]; b.Pg += g.P_mw / base_mva
+        b = _get_bus(bmap, g.bus, "Generatorul", g.name)
+        b.Pg += g.P_mw / base_mva
         if g.kind.lower() == "slack":
             b.type = "slack"; b.Vset = g.Vset
         else:
@@ -711,12 +728,16 @@ def compile_network(bus_elems, gens=(), loads=(), shunts=(), lines=(), trafos=()
             b.Qmin = g.Qmin_mvar / base_mva
             b.Qmax = g.Qmax_mvar / base_mva
     for ln in lines:
-        vb = bmap[ln.from_bus].Vbase_kv
+        bf = _get_bus(bmap, ln.from_bus, "Linia", ln.name)
+        _get_bus(bmap, ln.to_bus, "Linia", ln.name)
+        vb = bf.Vbase_kv
         R, X, B = line_to_pu(ln.length_km, ln.r_ohm_km, ln.x_ohm_km, ln.b_uS_km, vb, base_mva)
         net.add_branch(Branch(ln.from_bus, ln.to_bus, R=R, X=X, B=B, tap=1.0,
                               name=ln.name or f"{ln.from_bus}-{ln.to_bus}",
                               kind="line", rating_a=ln.rating_a))
     for tr in trafos:
+        _get_bus(bmap, tr.from_bus, "Transformatorul", tr.name)
+        _get_bus(bmap, tr.to_bus, "Transformatorul", tr.name)
         R, X = trafo_to_pu(tr.sr_mva, tr.uk_pct, tr.pcu_kw, base_mva)
         net.add_branch(Branch(tr.from_bus, tr.to_bus, R=R, X=X, B=0.0, tap=tr.tap,
                               phase_shift_deg=tr.shift_deg,
