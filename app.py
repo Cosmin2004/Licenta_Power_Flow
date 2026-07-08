@@ -746,13 +746,13 @@ with tabs[4]:
 dfs = {"bus": df_bus, "gen": df_gen, "load": df_load,
        "shunt": df_shunt, "line": df_line, "trafo": df_trafo}
 
-st.markdown("**💾 Salvează rețeaua curentă**")
+st.markdown("**Salvează rețeaua curentă**")
 sv1, sv2 = st.columns([3, 1])
 default_name = st.session_state.net_name if st.session_state.net_name not in NETWORKS else ""
 save_name = sv1.text_input("Nume pentru salvare", value=default_name,
                            placeholder="Rețea",
                            label_visibility="collapsed")
-if sv2.button("💾 Salvează", use_container_width=True):
+if sv2.button("Salvează", use_container_width=True):
     nm = save_name.strip()
     if not nm:
         st.warning("Dă un nume rețelei înainte de a o salva.")
